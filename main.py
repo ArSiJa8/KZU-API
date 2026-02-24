@@ -4,18 +4,18 @@ import requests
 import datetime
 from fastapi import FastAPI, HTTPException, Query
 from dotenv import load_dotenv
-from typing import Optional, List
+from typing import List
 
 load_dotenv()
 
-app = FastAPI(title="KZU Ultimate Timetable API")
+app = FastAPI(title="KZU Ultimate API", description="API für Stundenplan, Filter und Freiräume")
 
 USER = os.getenv("INTRANET_USER")
 PW = os.getenv("INTRANET_PW")
 BASE_URL = "https://intranet.tam.ch/kzu"
 
-# Hilfsfunktion für den Abruf
-def fetch_raw_data(days=7):
+# Zentrale Funktion zum Datenholen
+def fetch_kzu_data(start_date: datetime.date, end_date: datetime.date):
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0', 'X-Requested-With': 'XMLHttpRequest'})
 
@@ -25,76 +25,83 @@ def fetch_raw_data(days=7):
     if 'sturmsession' not in session.cookies:
         raise HTTPException(status_code=401, detail="Login fehlgeschlagen")
 
-    start_ts = int(time.time() * 1000)
-    end_ts = start_ts + (days * 24 * 60 * 60 * 1000)
+    # Umwandlung in Millisekunden-Timestamps für das Intranet
+    start_ts = int(time.mktime(start_date.timetuple()) * 1000)
+    end_ts = int(time.mktime(end_date.timetuple()) * 1000)
 
     ajax_url = f"{BASE_URL}/timetable/ajax-get-timetable"
-    response = session.post(ajax_url, data={'startDate': start_ts, 'endDate': end_ts, 'holidaysOnly': 0})
+    payload = {'startDate': start_ts, 'endDate': end_ts, 'holidaysOnly': 0}
 
+    response = session.post(ajax_url, data=payload)
     return response.json().get("data", [])
 
-# --- ENDPUNKTE ---
+# --- NEUE ENDPUNKTE ---
 
-@app.get("/all")
-def get_all():
-    """Gibt absolut alles zurück (nächste 7 Tage)."""
-    return fetch_raw_data()
+@app.get("/range")
+def get_range(start: str = Query(..., description="Format: YYYY-MM-DD"),
+              end: str = Query(..., description="Format: YYYY-MM-DD")):
+    """Holt Daten für einen beliebigen Bereich, z.B. /range?start=2026-03-01&end=2026-03-15"""
+    try:
+        d1 = datetime.date.fromisoformat(start)
+        d2 = datetime.date.fromisoformat(end)
+        return fetch_kzu_data(d1, d2)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Falsches Datumsformat. Nutze YYYY-MM-DD")
 
 @app.get("/today")
 def get_today():
-    """Nur die Lektionen von heute."""
-    all_data = fetch_raw_data(days=1)
-    today_str = datetime.date.today().isoformat()
-    return [d for d in all_data if d.get("lessonDate") == today_str]
+    today = datetime.date.today()
+    all_data = fetch_kzu_data(today, today)
+    return [d for d in all_data if d.get("lessonDate") == today.isoformat()]
 
-@app.get("/week")
-def get_week():
-    """Daten für die aktuelle Woche."""
-    return fetch_raw_data(days=7)
+@app.get("/free-rooms")
+def get_free_rooms():
+    """Zeigt Räume an, die JETZT gerade nicht belegt sind (basierend auf dem heutigen Plan)."""
+    today = datetime.date.today()
+    now = datetime.datetime.now().time()
+    all_lessons = fetch_kzu_data(today, today)
 
-@app.get("/filter/subject/{subject}")
-def filter_by_subject(subject: str):
-    """Filtert nach einem Fachnamen (z.B. /filter/subject/Mathematik)."""
-    all_data = fetch_raw_data(days=14)
-    return [d for d in all_data if subject.lower() in str(d.get("lessonName", "")).lower()]
+    # Alle Räume, die wir kennen (kannst du erweitern)
+    all_rooms = {"A06", "Z101", "Z102", "Z201", "Z205", "Physik1", "Turnhalle"}
+    occupied_rooms = set()
 
-@app.get("/filter/teacher/{acronym}")
-def filter_by_teacher(acronym: str):
-    """Filtert nach dem Lehrer-Kürzel (z.B. /filter/teacher/nig)."""
-    all_data = fetch_raw_data(days=14)
-    return [d for d in all_data if acronym.lower() == str(d.get("teacherAcronym", "")).lower()]
+    for lesson in all_lessons:
+        if lesson.get("lessonDate") == today.isoformat():
+            try:
+                # Zeiten vergleichen (Format "08:00:00")
+                start = datetime.datetime.strptime(lesson["lessonStart"], "%H:%M:%S").time()
+                end = datetime.datetime.strptime(lesson["lessonEnd"], "%H:%M:%S").time()
 
-@app.get("/filter/room/{room}")
-def filter_by_room(room: str):
-    """Filtert nach einem Raum (z.B. /filter/room/A06)."""
-    all_data = fetch_raw_data(days=7)
-    return [d for d in all_data if room.lower() in str(d.get("roomName", "")).lower()]
+                if start <= now <= end and lesson.get("timetableEntryTypeShort") != "cancel":
+                    if lesson.get("roomName"):
+                        occupied_rooms.add(lesson["roomName"])
+            except:
+                continue
+
+    free_rooms = all_rooms - occupied_rooms
+    return {
+        "time": now.strftime("%H:%M"),
+        "occupied": list(occupied_rooms),
+        "free": list(free_rooms)
+    }
 
 @app.get("/cancelled")
 def get_cancelled():
-    """Zeigt nur ausgefallene Lektionen an."""
-    all_data = fetch_raw_data(days=14)
-    return [d for d in all_data if d.get("timetableEntryTypeShort") == "cancel"]
+    today = datetime.date.today()
+    future = today + datetime.timedelta(days=14)
+    data = fetch_kzu_data(today, future)
+    return [d for d in data if d.get("timetableEntryTypeShort") == "cancel"]
 
 @app.get("/exams")
 def get_exams():
-    """Zeigt nur Prüfungen an."""
-    all_data = fetch_raw_data(days=30)
-    return [d for d in all_data if d.get("isExamLesson") == True]
-
-@app.get("/date/{date_str}")
-def get_by_date(date_str: str):
-    """Filtert nach einem bestimmten Datum (Format: YYYY-MM-DD, z.B. /date/2026-02-25)."""
-    all_data = fetch_raw_data(days=30)
-    return [d for d in all_data if d.get("lessonDate") == date_str]
+    today = datetime.date.today()
+    future = today + datetime.timedelta(days=30)
+    data = fetch_kzu_data(today, future)
+    return [d for d in data if d.get("isExamLesson") == True]
 
 @app.get("/")
-def home():
+def welcome():
     return {
-        "status": "online",
-        "endpoints": [
-            "/all", "/today", "/week", "/cancelled", "/exams",
-            "/filter/subject/{name}", "/filter/teacher/{acronym}",
-            "/filter/room/{room}", "/date/{YYYY-MM-DD}"
-        ]
+        "msg": "KZU API Online",
+        "endpoints": ["/today", "/range?start=...&end=...", "/free-rooms", "/cancelled", "/exams"]
     }
